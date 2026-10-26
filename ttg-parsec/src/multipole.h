@@ -2,8 +2,10 @@
 
 #include "types.h"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
+#include <limits>
 
 namespace bh {
 
@@ -108,17 +110,53 @@ inline bool mac_accept(const Vec3& target_pos, const Vec3& source_com, double ed
   return edge_length < theta * d;
 }
 
-// Conservative variant of mac_accept safe for an entire leaf's particles at
-// once rather than a single point: accepts only if the source would be
-// accepted (per mac_accept, above) for every point within target_radius of
-// target_center - i.e. tested against the worst case (nearest possible)
-// distance from the source to the target box, so it can only recurse more
-// than the exact per-particle test would, never approximate something that
-// test would have rejected.
-inline bool mac_accept_box(const Vec3& target_center, double target_radius, const Vec3& source_com,
-                            double edge_length, double theta) {
-  double d = norm(target_center - source_com);
-  return edge_length < theta * (d - target_radius);
+// Axis-aligned bounding box of a set of target particles (not of their
+// tree cell, which can be much larger than the particles in it).
+struct BBox {
+  Vec3 lo{std::numeric_limits<double>::max(), std::numeric_limits<double>::max(),
+          std::numeric_limits<double>::max()};
+  Vec3 hi{std::numeric_limits<double>::lowest(), std::numeric_limits<double>::lowest(),
+          std::numeric_limits<double>::lowest()};
+
+  void add(double x, double y, double z) {
+    lo.x = std::min(lo.x, x);
+    lo.y = std::min(lo.y, y);
+    lo.z = std::min(lo.z, z);
+    hi.x = std::max(hi.x, x);
+    hi.y = std::max(hi.y, y);
+    hi.z = std::max(hi.z, z);
+  }
+
+  // squared distance from p to the nearest / farthest point of the box
+  // (two-argument max, which compiles to a select rather than a branch)
+  double near2(const Vec3& p) const {
+    auto d = [](double v, double l, double h) { return std::max(std::max(l - v, v - h), 0.0); };
+    double dx = d(p.x, lo.x, hi.x), dy = d(p.y, lo.y, hi.y), dz = d(p.z, lo.z, hi.z);
+    return dx * dx + dy * dy + dz * dz;
+  }
+  double far2(const Vec3& p) const {
+    auto d = [](double v, double l, double h) { return std::max(v - l, h - v); };
+    double dx = d(p.x, lo.x, hi.x), dy = d(p.y, lo.y, hi.y), dz = d(p.z, lo.z, hi.z);
+    return dx * dx + dy * dy + dz * dz;
+  }
+};
+
+// Conservative variant of mac_accept for a whole set of target particles
+// at once: accepts only if mac_accept accepts the source for every point
+// of the targets' bounding box, i.e. tested against the nearest point of
+// that box, so it can only recurse more than the exact per-particle test
+// would, never approximate something that test would have rejected.
+// Squared (theta^2 d^2 > edge^2) to avoid a square root - this runs once
+// per visited node of every walk.
+inline bool mac_accept_bbox(const BBox& targets, const Vec3& source_com, double edge_length, double theta) {
+  return theta * theta * targets.near2(source_com) > edge_length * edge_length;
+}
+
+// Whether mac_accept_bbox rejects the source for *every* sub-box of
+// `targets` (tested against the box's farthest point), so a walk shared by
+// all of them can open it on their behalf (grouped_ttg.h).
+inline bool mac_reject_all(const BBox& targets, const Vec3& source_com, double edge_length, double theta) {
+  return theta * theta * targets.far2(source_com) <= edge_length * edge_length;
 }
 
 // Softened gravitational acceleration on a target from a source multipole

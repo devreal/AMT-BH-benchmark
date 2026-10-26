@@ -1,10 +1,12 @@
 #include "integrate.h"
 #include "integrate_ttg.h"
 #include "io.h"
+#include "distributed_tree.h"
 
 #include <ttg.h>
 
 #include <chrono>
+#include <cstdint>
 #include <iostream>
 #include <random>
 #include <stdexcept>
@@ -23,6 +25,12 @@ struct Options {
   double eps = 0.0;
   double G = 1.0;
   unsigned max_leaf = 8;
+  // Particles per coarse-grained task (grouped_ttg.h); 0 = one task per
+  // (target leaf, source node) pair (bh_pass.h).
+  std::uint32_t group_size = 256;
+  // Particles sharing one walk of the grouped pass (grouped_ttg.h): the
+  // topmost nodes with at most this many particles, or leaves.
+  std::uint32_t target_size = 32;
   bool use_quadrupole = true;
   int energy_every = 1;
   bool time_steps = false;
@@ -55,6 +63,10 @@ Options parse_args(int argc, char** argv) {
       opt.G = std::stod(next());
     } else if (a == "--max-leaf") {
       opt.max_leaf = static_cast<unsigned>(std::stoul(next()));
+    } else if (a == "--target-size") {
+      opt.target_size = static_cast<std::uint32_t>(std::stoul(next()));
+    } else if (a == "--group-size") {
+      opt.group_size = static_cast<std::uint32_t>(std::stoul(next()));
     } else if (a == "--no-quadrupole") {
       opt.use_quadrupole = false;
     } else if (a == "--vtk-prefix") {
@@ -98,7 +110,10 @@ std::vector<bh::Particle> make_random_particles(const Options& opt) {
   return particles;
 }
 
+// Output (reports, VTK) comes from rank 0 only; every rank holds all
+// particles after each step (see replicated.h).
 void report(int step, const std::vector<bh::Particle>& particles, double G, const char* tag = "") {
+  if (bh::this_rank() != 0) return;
   double ek = bh::kinetic_energy(particles);
   double ep = bh::potential_energy(particles, G);
   std::cout << "step " << step << tag << " E_K=" << ek << " E_P=" << ep << " E_T=" << (ek + ep)
@@ -106,9 +121,17 @@ void report(int step, const std::vector<bh::Particle>& particles, double G, cons
 }
 
 void report_timing(int step, const bh::StepTiming& t) {
-  double total = t.tree_build_ms + t.traversal_ms;
-  std::cout << "step " << step << " timing: tree=" << t.tree_build_ms
-             << "ms traversal=" << t.traversal_ms << "ms total=" << total << "ms\n";
+  if (bh::this_rank() != 0) return;
+  double total = t.tree_build_ms + t.traversal_ms + t.exchange_ms;
+  std::cout << "step " << step << " timing: tree=" << t.tree_build_ms << "ms traversal=" << t.traversal_ms << "ms";
+  if (bh::num_ranks() > 1) std::cout << " exchange=" << t.exchange_ms << "ms";
+  std::cout << " total=" << total << "ms\n";
+}
+
+void add_timing(bh::StepTiming& total, const bh::StepTiming& t) {
+  total.tree_build_ms += t.tree_build_ms;
+  total.traversal_ms += t.traversal_ms;
+  total.exchange_ms += t.exchange_ms;
 }
 
 }  // namespace
@@ -122,9 +145,20 @@ int main(int argc, char** argv) {
     std::vector<bh::Particle> particles =
         opt.input.empty() ? make_random_particles(opt) : bh::read_csv(opt.input);
     if (particles.empty()) throw std::runtime_error("input file contains no particles");
-    if (opt.input.empty()) {
+    if (opt.input.empty() && bh::this_rank() == 0) {
       std::cout << "generated " << particles.size() << " random particles (seed=" << opt.seed
                  << ", spread=" << opt.spread << ", vel_spread=" << opt.vel_spread << ")\n";
+    }
+
+    // The grouped pass on several ranks decomposes the domain: every rank
+    // keeps an equal slice of the input, and the first step moves the
+    // particles to their owners (distributed_tree.h). The per-node pass
+    // keeps all particles on every rank (replicated.h).
+    const bool distributed = opt.group_size > 0 && bh::num_ranks() > 1;
+    if (distributed) {
+      std::size_t n = particles.size(), r = bh::this_rank(), p = bh::num_ranks();
+      std::vector<bh::Particle> slice(particles.begin() + n * r / p, particles.begin() + n * (r + 1) / p);
+      particles.swap(slice);
     }
 
     bh::ForceParams fp;
@@ -134,6 +168,14 @@ int main(int argc, char** argv) {
     fp.use_quadrupole = opt.use_quadrupole;
 
     ttg::execute();
+
+    // All particles, for output on rank 0 (collective when distributed).
+    std::vector<bh::Particle> gathered;
+    auto for_output = [&](const std::vector<bh::Particle>& mine) -> const std::vector<bh::Particle>& {
+      if (!distributed) return mine;
+      gathered = bh::gather_particles(mine);
+      return gathered;
+    };
 
     // Optimized leapfrog: rather than kick(dt/2) -> drift(dt) -> kick(dt/2)
     // as three separate host-side passes per step, each force evaluation's
@@ -158,29 +200,34 @@ int main(int argc, char** argv) {
       bh::StepTiming timing;
       bh::StepTiming total_timing;
       auto* timing_ptr = opt.time_steps ? &timing : nullptr;
+      bh::GroupedWorkspace workspace;  // reused by every step (grouped pass only)
       auto run_start = std::chrono::steady_clock::now();
 
-      particles = bh::step_particles(std::move(particles), fp, opt.max_leaf, opt.dt / 2.0, opt.dt,
-                                      timing_ptr);
-      if (opt.energy_every > 0) report(0, particles, opt.G);
+      particles = bh::step_particles(std::move(particles), fp, opt.max_leaf, opt.group_size, opt.target_size,
+                                      opt.dt / 2.0, opt.dt,
+                                      timing_ptr, &workspace);
+      if (opt.energy_every > 0) report(0, for_output(particles), opt.G);
       if (opt.time_steps) {
         report_timing(0, timing);
-        total_timing.tree_build_ms += timing.tree_build_ms;
-        total_timing.traversal_ms += timing.traversal_ms;
+        add_timing(total_timing, timing);
       }
-      if (opt.write_vtk) bh::write_vtk(opt.vtk_prefix + "_0.vtk", particles);
+      if (opt.write_vtk) {
+        const auto& all = for_output(particles);
+        if (bh::this_rank() == 0) bh::write_vtk(opt.vtk_prefix + "_0.vtk", all);
+      }
 
       for (int step = 1; step < opt.steps; ++step) {
         particles =
-            bh::step_particles(std::move(particles), fp, opt.max_leaf, opt.dt, opt.dt, timing_ptr);
-        if (opt.energy_every > 0 && (step % opt.energy_every) == 0) report(step, particles, opt.G);
+            bh::step_particles(std::move(particles), fp, opt.max_leaf, opt.group_size, opt.target_size, opt.dt,
+                                opt.dt, timing_ptr, &workspace);
+        if (opt.energy_every > 0 && (step % opt.energy_every) == 0) report(step, for_output(particles), opt.G);
         if (opt.time_steps) {
           report_timing(step, timing);
-          total_timing.tree_build_ms += timing.tree_build_ms;
-          total_timing.traversal_ms += timing.traversal_ms;
+          add_timing(total_timing, timing);
         }
         if (opt.write_vtk) {
-          bh::write_vtk(opt.vtk_prefix + "_" + std::to_string(step) + ".vtk", particles);
+          const auto& all = for_output(particles);
+          if (bh::this_rank() == 0) bh::write_vtk(opt.vtk_prefix + "_" + std::to_string(step) + ".vtk", all);
         }
       }
 
@@ -191,24 +238,28 @@ int main(int argc, char** argv) {
       // synced-vs-half-step energy agree to within the expected O(dt)
       // leapfrog discretization error.
       particles =
-          bh::step_particles(std::move(particles), fp, opt.max_leaf, opt.dt / 2.0, 0.0, timing_ptr);
-      if (opt.energy_every > 0) report(opt.steps - 1, particles, opt.G, " (synced)");
+          bh::step_particles(std::move(particles), fp, opt.max_leaf, opt.group_size, opt.target_size,
+                              opt.dt / 2.0, 0.0, timing_ptr, &workspace);
+      if (opt.energy_every > 0) report(opt.steps - 1, for_output(particles), opt.G, " (synced)");
       if (opt.time_steps) {
-        total_timing.tree_build_ms += timing.tree_build_ms;
-        total_timing.traversal_ms += timing.traversal_ms;
+        add_timing(total_timing, timing);
       }
 
       auto run_end = std::chrono::steady_clock::now();
-      if (opt.time_steps) {
+      if (opt.time_steps && bh::this_rank() == 0) {
         double wall_ms = std::chrono::duration<double, std::milli>(run_end - run_start).count();
         int n_evals = opt.steps + 1;  // matches step_particles() call count above
-        double sum_ms = total_timing.tree_build_ms + total_timing.traversal_ms;
+        double sum_ms = total_timing.tree_build_ms + total_timing.traversal_ms + total_timing.exchange_ms;
         std::cout << "timing summary: evals=" << n_evals << " wall=" << wall_ms << "ms"
                    << " tree=" << total_timing.tree_build_ms
                    << "ms (avg " << total_timing.tree_build_ms / n_evals << "ms)"
                    << " traversal=" << total_timing.traversal_ms << "ms (avg "
-                   << total_timing.traversal_ms / n_evals << "ms)"
-                   << " sum=" << sum_ms << "ms\n";
+                   << total_timing.traversal_ms / n_evals << "ms)";
+        if (bh::num_ranks() > 1) {
+          std::cout << " exchange=" << total_timing.exchange_ms << "ms (avg " << total_timing.exchange_ms / n_evals
+                    << "ms)";
+        }
+        std::cout << " sum=" << sum_ms << "ms\n";
       }
     }
 

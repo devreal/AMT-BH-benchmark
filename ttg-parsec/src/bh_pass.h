@@ -41,7 +41,7 @@ inline BHPass make_bh_pass(Tree& tree, const ForceParams& fp, SinkFn on_result) 
 inline void run_bh_pass(Tree& tree, BHPass& p) {
   ttg::make_graph_executable(p.up.seed_leaf.get(), p.up.combine_up.get(), p.down.seed_from_upward.get(),
                               p.down.dispatch.get(), p.down.combine_down.get(), p.down.sink.get());
-  if (ttg::default_execution_context().rank() == 0) {
+  {  // on every rank: each runs its own replica of the upward pass (see replicated.h)
     const auto& particles = tree.particles();
     bool root_is_leaf = tree.is_leaf(tree.root());
     for (auto& [key, node] : tree.nodes()) {
@@ -63,7 +63,7 @@ inline void run_bh_pass(Tree& tree, BHPass& p) {
         // dispatch's leaf branch reduces exactly to "sum this leaf's own
         // particles against each other."
         p.up.leaf_particles->data[key] = std::move(leaf_particles);
-        p.down.seed_direct(key);
+        if (this_rank() == 0) p.down.seed_direct(key);
       } else {
         p.up.seed(key, std::move(leaf_particles));
       }

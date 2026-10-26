@@ -7,8 +7,10 @@
 
 namespace bh {
 
-// Reads the whitepaper's headerless input format:
+// Reads the whitepaper's input format, one particle per line:
 // id,mass,pos_x,pos_y,pos_z,vel_x,vel_y,vel_z
+// with an optional header line (as written by the AMT-BH benchmark's data
+// generator). Parallel over the usable CPUs - call before ttg::execute().
 std::vector<Particle> read_csv(const std::string& path);
 
 // Writes a legacy VTK ASCII PolyData snapshot (points + mass scalar +

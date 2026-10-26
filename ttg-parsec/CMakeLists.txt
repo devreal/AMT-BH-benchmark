@@ -11,11 +11,13 @@ if (NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 
-# Reuse the already-cloned PaRSEC/MADNESS/etc. sources from the prior TTG
-# build (same repo URLs/tags, just built with different flags there) so
-# FetchContent only needs to reconfigure+rebuild them, not re-clone from
-# GitHub.
-set(FETCHCONTENT_BASE_DIR "/Users/joseph/src/ttg/ttg/build/_deps" CACHE PATH "")
+# FetchContent's dependency sources/build dirs live under the build tree by
+# default (${CMAKE_BINARY_DIR}/_deps). If you already have a TTG build
+# elsewhere with the same deps cloned, point FETCHCONTENT_BASE_DIR at its
+# _deps directory (e.g. -DFETCHCONTENT_BASE_DIR=/path/to/ttg/build/_deps)
+# so FetchContent reconfigures+rebuilds them instead of re-cloning from
+# GitHub - but don't hardcode that path here, since it won't exist on
+# other systems.
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake/modules")
 include(FindOrFetchTTG)
@@ -28,6 +30,19 @@ include(FindOrFetchTTG)
 # FetchContent_MakeAvailable(ttg) set in our scope.
 list(APPEND CMAKE_MODULE_PATH "${ttg_SOURCE_DIR}/cmake/modules")
 include(AddTTGExecutable)
+
+# Compile our own targets (not the fetched TTG/PaRSEC/MADNESS, added above)
+# for the build machine's ISA: the force kernel's SIMD width and rsqrt path
+# (src/simd.h) are picked from the target ISA macros, so a plain x86-64
+# build would fall back to SSE2. Turn off for portable binaries.
+option(BH_NATIVE_ARCH "Compile with -march=native" ON)
+if (BH_NATIVE_ARCH)
+  include(CheckCXXCompilerFlag)
+  check_cxx_compiler_flag("-march=native" BH_HAVE_MARCH_NATIVE)
+  if (BH_HAVE_MARCH_NATIVE)
+    add_compile_options(-march=native)
+  endif()
+endif()
 
 enable_testing()
 

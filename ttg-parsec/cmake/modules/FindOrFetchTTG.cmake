@@ -27,7 +27,7 @@ endif()
 if (TARGET ttg)
   message(STATUS "Found ttg CONFIG at ${ttg_CONFIG}")
 else()
-  set(TTG_GIT_REPOSITORY "git@github.com:devreal/ttg.git" CACHE STRING
+  set(TTG_GIT_REPOSITORY "https://github.com/devreal/ttg.git" CACHE STRING
     "TTG git repository to fetch")
   set(TTG_GIT_TAG "ttg-kernel-batching_aggregators" CACHE STRING
     "TTG git branch/tag/commit to fetch")

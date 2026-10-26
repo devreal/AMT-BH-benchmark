@@ -2,6 +2,7 @@
 
 #include "multipole.h"
 #include "particle.h"
+#include "replicated.h"
 #include "tree.h"
 #include "types.h"
 
@@ -17,10 +18,11 @@ namespace bh {
 // tree's node Keys:
 //   seed_leaf   - one task per leaf; receives that leaf's own particles
 //                 directly as data (rather than reaching into a shared
-//                 particle array via an index range) and computes that
-//                 leaf's contribution as a RawMoment about its PARENT's box
-//                 center (skipping any intermediate "leaf's own multipole"
-//                 step - see multipole.h), forwarding it into raw_edge. It
+//                 particle array via an index range), finalizes the leaf's
+//                 own multipole into multipoles, below (the downward pass
+//                 MAC-tests leaf sources too), and forwards it re-expressed
+//                 as a RawMoment about its PARENT's box center into
+//                 raw_edge. It
 //                 also deposits its particles into leaf_particles, below,
 //                 for the downward pass to read when it needs a leaf's data
 //                 for a reason other than being the fixed target of a
@@ -71,17 +73,24 @@ inline UpwardGraph make_upward_graph(Tree& tree) {
   auto multipoles = g.multipoles;
 
   auto seed_leaf_tt = ttg::make_tt(
-      [&tree, leaf_particles](const Key& leaf_key, const std::vector<Particle>& particles) {
+      [&tree, leaf_particles, multipoles](const Key& leaf_key, const std::vector<Particle>& particles) {
         {
           std::lock_guard<std::mutex> lock(leaf_particles->mutex);
           leaf_particles->data[leaf_key] = particles;
         }
         if (leaf_key == tree.root()) return;  // degenerate single-leaf tree: nothing to combine
+        // The leaf's own multipole, for the downward pass's MAC test of
+        // leaf sources (see make_downward_graph in traversal_ttg.h).
+        const Vec3& own_ref = tree.box_geometry(leaf_key).first;
+        RawMoment own;
+        for (const auto& p : particles) own += raw_moment_of_particle(p.mass, p.pos, own_ref);
+        Multipole multipole = finalize_raw_moment(own, own_ref);
+        {
+          std::lock_guard<std::mutex> lock(multipoles->mutex);
+          multipoles->data[leaf_key] = multipole;
+        }
         Key parent_key = leaf_key.parent();
-        const Vec3& ref = tree.box_geometry(parent_key).first;
-        RawMoment rm;
-        for (const auto& p : particles) rm += raw_moment_of_particle(p.mass, p.pos, ref);
-        ttg::send<0>(parent_key, rm);
+        ttg::send<0>(parent_key, raw_moment_from_multipole(multipole, tree.box_geometry(parent_key).first));
       },
       ttg::edges(g.seed_edge), ttg::edges(g.raw_edge), "seed_leaf");
 
@@ -107,6 +116,10 @@ inline UpwardGraph make_upward_graph(Tree& tree) {
         }
       },
       ttg::edges(agg_edge), ttg::edges(g.raw_edge, g.done_edge), "combine_up");
+
+  // replicated on every rank (see replicated.h)
+  seed_leaf_tt->set_keymap(local_keymap());
+  combine_up_tt->set_keymap(local_keymap());
 
   auto* seed_terminal = seed_leaf_tt->template in<0>();
   g.seed = [seed_terminal](Key key, std::vector<Particle> particles) {

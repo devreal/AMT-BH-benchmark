@@ -3,6 +3,7 @@
 #include "key.h"
 #include "multipole.h"
 #include "particle.h"
+#include "replicated.h"
 #include "tree.h"
 #include "types.h"
 
@@ -30,7 +31,7 @@ namespace bh {
 // of this pass did, keyed by (ParticleId, Key)) means every particle in a
 // leaf shares the exact same traversal decisions and task count, cutting the
 // number of dispatch/combine_down task instances by roughly
-// max_particles_per_leaf - see mac_accept_box (multipole.h) for the
+// max_particles_per_leaf - see mac_accept_bbox (multipole.h) for the
 // leaf-wide MAC test that makes this safe.
 struct NN {
   Key target;  // the leaf whose particles are being evaluated (fixed for the whole descent)
@@ -94,7 +95,7 @@ namespace bh {
 //                 combine_up - the same "produced once, consumed by however
 //                 many different targets reach it" shape as leaf_particles)
 //                 and tests the whole target leaf against it via
-//                 mac_accept_box; if it accepts, evaluates that multipole
+//                 mac_accept_bbox; if it accepts, evaluates that multipole
 //                 against every target particle; if not, recurses into
 //                 every ACTUAL child of source (a small, statically-known
 //                 set from the node table) via the self-looping
@@ -158,7 +159,27 @@ inline DownwardGraph make_downward_graph(Tree& tree, const ForceParams& fp, Sink
         std::vector<Vec3> contrib(target_particles.size(), Vec3{});
         bool resolved = false;
 
-        if (tree.is_leaf(key.source)) {
+        // The MAC is tested for leaf sources too, so a distant leaf
+        // contributes one monopole rather than a direct sum over its
+        // particles. A target is never tested against itself (it can never
+        // pass - its own center of mass is inside its particles' bounding
+        // box), which also covers the single-leaf tree, whose root leaf has
+        // no multipole deposited (see bh_pass.h).
+        if (key.source != key.target) {
+          const Multipole& source_multipole = multipoles->data.at(key.source);
+          double edge_length = 2.0 * tree.box_geometry(key.source).second;
+          BBox target_box;
+          for (const auto& tp : target_particles) target_box.add(tp.pos.x, tp.pos.y, tp.pos.z);
+          if (mac_accept_bbox(target_box, source_multipole.com, edge_length, fp.theta)) {
+            for (std::size_t ti = 0; ti < target_particles.size(); ++ti) {
+              contrib[ti] = accel_from_source(target_particles[ti].pos, source_multipole.mass,
+                                               source_multipole.com, source_multipole.iab, fp.eps2,
+                                               fp.use_quadrupole, fp.G);
+            }
+            resolved = true;
+          }
+        }
+        if (!resolved && tree.is_leaf(key.source)) {
           const auto& source_particles = leaf_particles->data.at(key.source);
           for (std::size_t ti = 0; ti < target_particles.size(); ++ti) {
             const Particle& tp = target_particles[ti];
@@ -170,20 +191,6 @@ inline DownwardGraph make_downward_graph(Tree& tree, const ForceParams& fp, Sink
             contrib[ti] = a;
           }
           resolved = true;
-        } else {
-          const Multipole& source_multipole = multipoles->data.at(key.source);
-          double source_half_width = tree.box_geometry(key.source).second;
-          auto [target_center, target_half_width] = tree.box_geometry(key.target);
-          double edge_length = 2.0 * source_half_width;
-          double target_radius = target_half_width * std::sqrt(3.0);
-          if (mac_accept_box(target_center, target_radius, source_multipole.com, edge_length, fp.theta)) {
-            for (std::size_t ti = 0; ti < target_particles.size(); ++ti) {
-              contrib[ti] = accel_from_source(target_particles[ti].pos, source_multipole.mass,
-                                               source_multipole.com, source_multipole.iab, fp.eps2,
-                                               fp.use_quadrupole, fp.G);
-            }
-            resolved = true;
-          }
         }
 
         if (resolved) {
@@ -226,13 +233,21 @@ inline DownwardGraph make_downward_graph(Tree& tree, const ForceParams& fp, Sink
       },
       ttg::edges(final_edge), ttg::edges(), "sink");
 
+  // Only this rank's target leaves (see replicated.h); every task stays local.
   auto seed_from_upward_tt = ttg::make_tt(
-      [leaf_particles, root](const Key&) {
+      [&tree, leaf_particles, root](const Key&) {
+        const int nranks = num_ranks(), me = this_rank();
         for (auto& [leaf_key, particles] : leaf_particles->data) {
+          if (owner_of(tree.node(leaf_key).particle_begin, tree.num_particles(), nranks) != me) continue;
           ttg::send<0>(NN{leaf_key, root}, particles);
         }
       },
       ttg::edges(upward_done_edge), ttg::edges(descend_edge), "seed_from_upward");
+
+  seed_from_upward_tt->set_keymap(local_keymap());
+  dispatch_tt->set_keymap(local_keymap());
+  combine_down_tt->set_keymap(local_keymap());
+  sink_tt->set_keymap(local_keymap());
 
   auto* descend_terminal = dispatch_tt->template in<0>();
   g.seed_direct = [descend_terminal, leaf_particles](Key leaf) {

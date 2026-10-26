@@ -72,6 +72,13 @@ struct MultipoleStore {
 class Tree {
  public:
   Tree(std::vector<Particle> particles, unsigned max_particles_per_leaf);
+  // For a distributed build: every rank must agree on the same Domain (see
+  // compute_domain() in domain.h, computed once from ALL ranks' particles
+  // combined) rather than each deriving its own from whatever slice of
+  // particles it happens to own - otherwise the same Key would mean a
+  // different physical box on different ranks. See morton.h/
+  // distributed_upward.h.
+  Tree(std::vector<Particle> particles, unsigned max_particles_per_leaf, const Domain& domain);
 
   std::vector<Particle>& particles() { return particles_; }
   const std::vector<Particle>& particles() const { return particles_; }

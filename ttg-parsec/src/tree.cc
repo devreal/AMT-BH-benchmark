@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <array>
-#include <limits>
 
 namespace bh {
 
@@ -30,25 +29,14 @@ constexpr int kMaxDepth = static_cast<int>(MAX_LEVEL);
 
 Tree::Tree(std::vector<Particle> particles, unsigned max_particles_per_leaf)
     : particles_(std::move(particles)) {
-  Vec3 lo{std::numeric_limits<double>::max(), std::numeric_limits<double>::max(),
-          std::numeric_limits<double>::max()};
-  Vec3 hi{std::numeric_limits<double>::lowest(), std::numeric_limits<double>::lowest(),
-          std::numeric_limits<double>::lowest()};
-  for (const auto& p : particles_) {
-    lo.x = std::min(lo.x, p.pos.x);
-    lo.y = std::min(lo.y, p.pos.y);
-    lo.z = std::min(lo.z, p.pos.z);
-    hi.x = std::max(hi.x, p.pos.x);
-    hi.y = std::max(hi.y, p.pos.y);
-    hi.z = std::max(hi.z, p.pos.z);
-  }
-  Vec3 center{0.5 * (lo.x + hi.x), 0.5 * (lo.y + hi.y), 0.5 * (lo.z + hi.z)};
-  double half_width = 0.5 * std::max({hi.x - lo.x, hi.y - lo.y, hi.z - lo.z});
-  if (!(half_width > 0.0)) half_width = 1.0;  // degenerate input (0 or 1 distinct position)
-  half_width *= 1.0 + 1e-9;                   // avoid excluding particles exactly on the boundary
-  domain_.center = center;
-  domain_.half_width = half_width;
+  domain_ = compute_domain(particles_);
+  scratch_.resize(particles_.size());
+  root_ = Key(0, {0, 0, 0});
+  build_recursive(0, static_cast<std::uint32_t>(particles_.size()), root_, max_particles_per_leaf, 0);
+}
 
+Tree::Tree(std::vector<Particle> particles, unsigned max_particles_per_leaf, const Domain& domain)
+    : particles_(std::move(particles)), domain_(domain) {
   scratch_.resize(particles_.size());
   root_ = Key(0, {0, 0, 0});
   build_recursive(0, static_cast<std::uint32_t>(particles_.size()), root_, max_particles_per_leaf, 0);
